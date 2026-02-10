@@ -6,34 +6,40 @@ import numpy as np
 
 @dataclass
 class EnvParams:
-    # Simulation
-    dt: float = 0.2
-    episode_time_limit: float = 90.0
+    """Centralized knobs for the simulator; tweak here during live demos."""
 
-    # Geometry / timing
+    # --- Simulation clock ---
+    dt: float = 0.2
+    episode_time_limit: float = 60.0
+
+    # --- Layout / geometry ---
     spawn_distance_m: float = 120.0
 
-    # Pedestrian: time to cross ONE lane (older pedestrian)
-    t_lane_s: float = 4.5
+    # Pedestrian: time to cross ONE lane
+    t_lane_s: float = 4.0
 
-    # Vehicle speed model (50–55 km/h typical)
+    # --- Vehicle speed model (50–55 km/h typical) ---
     v_mean_mps: float = 52.5 / 3.6   # ≈ 14.58 m/s
     v_std_mps: float = 1.0
     v_min_mps: float = 45.0 / 3.6   # ≈ 12.50 m/s
     v_max_mps: float = 60.0 / 3.6   # ≈ 16.67 m/s
 
-    # Traffic arrivals
+    # --- Traffic arrivals ---
     min_headway_s: float = 0.8
     warmup_time_s: float = 10.0
 
     # Visual/realism: prevent cars overlapping in same lane (1D no-overtake)
     min_car_spacing_m: float = 12.0
 
-    # Reward
-    r_collision: float = -12.0
-    r_success: float = +15.0
-    r_step: float = -0.05
-    r_timeout: float = -12.0
+    # --- Reward knobs (highlight when presenting) ---
+    r_collision: float = -120.0   # Collisions are catastrophic
+    r_success: float = 10.0       # Reward for clearing both lanes
+    r_step: float = -0.003        # dt=0.2, horizon 60s -> 300 steps max => at worst 300 * -0.003 = -0.9 per episode
+    r_timeout: float = -3.0       # Timing out hurts but far less than a crash
+    r_reach_median: float = 2.0
+
+    # Geometry-derived helper
+    safety_margin_s: float = 1.0  # Extra buffer seconds added on top of t_lane_s when evaluating safe gaps
 
 
 @dataclass
@@ -104,68 +110,6 @@ class PedestrianCrossingEnv:
         self.t = 0.0
         return self._get_state()
 
-    # def step(self, action: int) -> Tuple[np.ndarray, float, bool, dict]:
-    #     action = int(action)
-    #     done = False
-    #     terminal_event = None
-
-    #     # time always passes -> apply step penalty every step
-    #     reward = float(self.params.r_step)
-
-    #     # 1) Apply action (only meaningful at CURB or MEDIAN)
-    #     if action == self.ACTION_GO:
-    #         if self.ped_stage == self.STAGE_CURB:
-    #             self.ped_stage = self.STAGE_CROSS_LANE1
-    #             self.t_in_stage = 0.0
-    #         elif self.ped_stage == self.STAGE_MEDIAN:
-    #             self.ped_stage = self.STAGE_CROSS_LANE2
-    #             self.t_in_stage = 0.0
-    #         # else: already crossing -> no-op
-
-    #     # 2) Advance traffic
-    #     self._advance_lane(0, self.scenario.lambda_lane1)
-    #     self._advance_lane(1, self.scenario.lambda_lane2)
-
-    #     # 3) Advance time and crossing timer
-    #     self.t += self.params.dt
-    #     if self.ped_stage in (self.STAGE_CROSS_LANE1, self.STAGE_CROSS_LANE2):
-    #         self.t_in_stage += self.params.dt
-
-    #     # 4) Collision (only when exposed)
-    #     if self._check_collision():
-    #         reward = float(self.params.r_collision)  # override
-    #         done = True
-    #         terminal_event = "collision"
-
-    #     # 5) If safe: stage transitions / success
-    #     if not done:
-    #         if self.ped_stage == self.STAGE_CROSS_LANE1 and self.t_in_stage >= self.params.t_lane_s:
-    #             self.ped_stage = self.STAGE_MEDIAN
-    #             self.t_in_stage = 0.0
-
-    #         elif self.ped_stage == self.STAGE_CROSS_LANE2 and self.t_in_stage >= self.params.t_lane_s:
-    #             reward += float(self.params.r_success)
-    #             done = True
-    #             terminal_event = "success"
-
-    #     # 6) Timeout (only if still not done)
-    #     if (not done) and (self.t >= self.params.episode_time_limit):
-    #         reward += float(self.params.r_timeout)
-    #         done = True
-    #         terminal_event = "timeout"
-
-    #     state = self._get_state()
-    #     info = {
-    #         "t": float(self.t),
-    #         "tta_lane1": float(self._tta_lane(0)),
-    #         "tta_lane2": float(self._tta_lane(1)),
-    #         "ped_stage": int(self.ped_stage),
-    #         "stage_progress": float(self._stage_progress()),
-    #         "n_cars_lane1": int(len(self.cars[0])),
-    #         "n_cars_lane2": int(len(self.cars[1])),
-    #         "terminal_event": terminal_event,
-    #     }
-    #     return state, float(reward), bool(done), info
     def step(self, action: int) -> Tuple[np.ndarray, float, bool, dict]:
         action = int(action)
         done = False
@@ -174,35 +118,17 @@ class PedestrianCrossingEnv:
         # time always passes -> step penalty
         reward = float(self.params.r_step)
 
-        # ----------------------------
-        # Stronger decision-point shaping
-        # ----------------------------
-        tau = 0.8               # bigger safety margin -> less risky crossings
-        r_safe_go = 1.0         # reward if GO is taken in a safe gap
-        r_unsafe_go = -2        # stronger penalty if GO is taken in an unsafe gap
-        r_reach_median = 2.0    # subgoal reward after crossing lane 1
-        r_spam_go = -0.02       # discourage pressing GO while already crossing
-
         # 1) Apply action (meaningful only at CURB or MEDIAN)
         if action == self.ACTION_GO:
             if self.ped_stage == self.STAGE_CURB:
-                tta1 = self._tta_lane(0)
-                safe = (tta1 > (self.params.t_lane_s + tau))
-                reward += r_safe_go if safe else r_unsafe_go
-
                 self.ped_stage = self.STAGE_CROSS_LANE1
                 self.t_in_stage = 0.0
 
             elif self.ped_stage == self.STAGE_MEDIAN:
-                tta2 = self._tta_lane(1)
-                safe = (tta2 > (self.params.t_lane_s + tau))
-                reward += r_safe_go if safe else r_unsafe_go
-
                 self.ped_stage = self.STAGE_CROSS_LANE2
                 self.t_in_stage = 0.0
-
-            else:
-                reward += r_spam_go
+        else:
+            pass
 
         # 2) Advance traffic
         self._advance_lane(0, self.scenario.lambda_lane1)
@@ -215,7 +141,7 @@ class PedestrianCrossingEnv:
 
         # 4) Collision (only when exposed)
         if self._check_collision():
-            reward = float(self.params.r_collision)  # override
+            reward += self.params.r_collision # override
             done = True
             terminal_event = "collision"
 
@@ -224,7 +150,7 @@ class PedestrianCrossingEnv:
             if self.ped_stage == self.STAGE_CROSS_LANE1 and self.t_in_stage >= self.params.t_lane_s:
                 self.ped_stage = self.STAGE_MEDIAN
                 self.t_in_stage = 0.0
-                reward += r_reach_median
+                reward += self.params.r_reach_median
 
             elif self.ped_stage == self.STAGE_CROSS_LANE2 and self.t_in_stage >= self.params.t_lane_s:
                 reward += float(self.params.r_success)
@@ -259,38 +185,31 @@ class PedestrianCrossingEnv:
             return float(np.clip(self.t_in_stage / self.params.t_lane_s, 0.0, 1.0))
         return 0.0
 
-    # def _get_state(self) -> np.ndarray:
-    #     tta1 = self._tta_lane(0)
-    #     tta2 = self._tta_lane(1)
-    #     return np.array([tta1, tta2, float(self.ped_stage), self._stage_progress()], dtype=np.float32)
-    # def _get_state(self) -> np.ndarray:
-    #     tta1 = self._tta_lane(0)
-    #     tta2 = self._tta_lane(1)
+    def _safe_threshold(self) -> float:
+        return float(self.params.t_lane_s + self.params.safety_margin_s + self.params.dt)
 
-    #     # Only observe the relevant direction:
-    #     # - CURB / crossing lane1: lane 0 relevant
-    #     # - MEDIAN / crossing lane2: lane 1 relevant
-    #     if self.ped_stage in (self.STAGE_CURB, self.STAGE_CROSS_LANE1):
-    #         tta2 = 999.0
-    #     elif self.ped_stage in (self.STAGE_MEDIAN, self.STAGE_CROSS_LANE2):
-    #         tta1 = 999.0
-
-    #     return np.array([tta1, tta2, float(self.ped_stage), self._stage_progress()], dtype=np.float32)
     def _get_state(self) -> np.ndarray:
+        """Return normalized state: [tta1_rel, tta2_rel, stage, progress, active1, active2]."""
         tta1 = self._tta_lane(0)
         tta2 = self._tta_lane(1)
+        threshold = self._safe_threshold()
 
-        # Clip TTAs (prevents huge values)
-        tta1 = min(tta1, 30.0)
-        tta2 = min(tta2, 30.0)
+        lane1_active = 1.0 if self.ped_stage in (self.STAGE_CURB, self.STAGE_CROSS_LANE1) else 0.0
+        lane2_active = 1.0 if self.ped_stage in (self.STAGE_MEDIAN, self.STAGE_CROSS_LANE2) else 0.0
 
-        # Mask irrelevant lane using same scale
-        if self.ped_stage in (self.STAGE_CURB, self.STAGE_CROSS_LANE1):
-            tta2 = 30.0
-        elif self.ped_stage in (self.STAGE_MEDIAN, self.STAGE_CROSS_LANE2):
-            tta1 = 30.0
+        if lane1_active == 0.0:
+            tta1 = 0.0
+        if lane2_active == 0.0:
+            tta2 = 0.0
 
-        return np.array([tta1, tta2, float(self.ped_stage), self._stage_progress()], dtype=np.float32)
+        scale = threshold if threshold > 1e-6 else 1.0
+        tta1_rel = float(np.clip(tta1 / scale, 0.0, 6.0))
+        tta2_rel = float(np.clip(tta2 / scale, 0.0, 6.0))
+
+        return np.array(
+            [tta1_rel, tta2_rel, float(self.ped_stage), self._stage_progress(), lane1_active, lane2_active],
+            dtype=np.float32,
+        )
 
 
     def _tta_lane(self, lane: int) -> float:
@@ -351,13 +270,13 @@ class PedestrianCrossingEnv:
             self.cars[lane] = cars
 
     def _advance_lane(self, lane: int, lam: float) -> None:
-        # spawn
+        # --- 1) spawn arrivals according to Poisson gap model ---
         self._t_next_arrival[lane] -= self.params.dt
         while self._t_next_arrival[lane] <= 0.0:
             self._spawn_car(lane)
             self._t_next_arrival[lane] += self._sample_interarrival(lam)
 
-        # move
+        # --- 2) integrate vehicle motion ---
         for c in self.cars[lane]:
             c["x_prev"] = c["x"]  
             if lane == 0:
@@ -365,9 +284,8 @@ class PedestrianCrossingEnv:
             else:
                 c["x"] += c["v"] * self.params.dt
 
-
-        # keep spacing (helps realism + visuals)
-        #self._enforce_min_spacing(lane)
+        # --- 3) enforce spacing + prune passed cars ---
+        self._enforce_min_spacing(lane)
 
         # cleanup (cars far past crossing line)
         if lane == 0:
@@ -378,32 +296,14 @@ class PedestrianCrossingEnv:
     # -----------------------
     # Collision logic
     # -----------------------
-    # def _check_collision(self) -> bool:
-    #     if self.ped_stage == self.STAGE_CROSS_LANE1:
-    #         return any(c["x"] <= 0.0 for c in self.cars[0])
-    #     if self.ped_stage == self.STAGE_CROSS_LANE2:
-    #         return any(c["x"] >= 0.0 for c in self.cars[1])
-    #     return False
     def _check_collision(self) -> bool:
+        """Check whether any car crossed x=0 while the pedestrian is exposed."""
         if self.ped_stage == self.STAGE_CROSS_LANE1:
-            # lane 0 crosses from + to 0
+            # lane 0: cars move from + towards 0 (right to left)
             return any((c.get("x_prev", c["x"]) > 0.0) and (c["x"] <= 0.0) for c in self.cars[0])
 
         if self.ped_stage == self.STAGE_CROSS_LANE2:
-            # lane 1 crosses from - to 0
+            # lane 1: cars move from - towards 0 (left to right)
             return any((c.get("x_prev", c["x"]) < 0.0) and (c["x"] >= 0.0) for c in self.cars[1])
 
         return False
-
-
-    # -----------------------
-    # Rendering
-    # -----------------------
-    def render_data(self):
-        return {
-            "cars_lane1": [(c["x"], c["v"]) for c in self.cars[0]],
-            "cars_lane2": [(c["x"], c["v"]) for c in self.cars[1]],
-            "ped_stage": int(self.ped_stage),
-            "stage_progress": float(self._stage_progress()),
-            "t": float(self.t),
-        }
